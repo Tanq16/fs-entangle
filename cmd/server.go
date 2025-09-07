@@ -21,7 +21,7 @@ var (
 func init() {
 	serverCmd.Flags().IntVarP(&serverPort, "port", "p", 8080, "Port for the server to listen on")
 	serverCmd.Flags().StringVarP(&serverDir, "dir", "d", ".", "Directory to sync (server's source of truth)")
-	serverCmd.Flags().StringVar(&serverIgnores, "ignore", "", "Comma-separated list of paths/patterns to ignore")
+	serverCmd.Flags().StringVar(&serverIgnores, "ignore", "", "Comma-separated list of glob patterns to ignore (e.g., '.git/*,*.tmp')")
 }
 
 func runServer(cmd *cobra.Command, args []string) {

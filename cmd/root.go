@@ -11,7 +11,7 @@ import (
 
 var rootCmd = &cobra.Command{
 	Use:   "fs-entangle",
-	Short: "A tool for real-time, bi-directional file synchronization.",
+	Short: "A tool for real-time file synchronization.",
 }
 
 func Execute() {
@@ -31,7 +31,6 @@ func initConfig() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{
 		Out:        os.Stderr,
 		TimeFormat: time.RFC3339,
-		NoColor:    false,
 	})
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Info().Msg("Logger initialized")

@@ -21,7 +21,7 @@ var (
 func init() {
 	clientCmd.Flags().StringVarP(&serverAddr, "addr", "a", "ws://localhost:8080/ws", "Address of the fs-entangle server")
 	clientCmd.Flags().StringVarP(&clientDir, "dir", "d", ".", "Directory to sync with the server")
-	clientCmd.Flags().StringVar(&clientIgnores, "ignore", "", "Comma-separated list of paths/patterns to ignore for local changes")
+	clientCmd.Flags().StringVar(&clientIgnores, "ignore", "", "Comma-separated list of glob patterns to ignore for local changes (e.g., 'node_modules/*,*.log')")
 }
 
 func runClient(cmd *cobra.Command, args []string) {

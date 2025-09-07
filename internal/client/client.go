@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -21,12 +22,14 @@ type Config struct {
 }
 
 type Client struct {
-	cfg         Config
-	conn        *websocket.Conn
-	watcher     *fsnotify.Watcher
-	ignorer     *common.PathIgnorer
-	isSyncing   bool
-	writeEvents map[string]time.Time
+	cfg     Config
+	conn    *websocket.Conn
+	watcher *fsnotify.Watcher
+	ignorer *common.PathIgnorer
+	// isSyncing prevents the watcher from reacting to changes made by the client itself
+	syncingMutex sync.Mutex
+	isSyncing    bool
+	writeMutex   sync.Mutex
 }
 
 func New(cfg Config) (*Client, error) {
@@ -38,10 +41,9 @@ func New(cfg Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to create file watcher: %w", err)
 	}
 	return &Client{
-		cfg:         cfg,
-		watcher:     watcher,
-		ignorer:     common.NewPathIgnorer(cfg.IgnorePaths),
-		writeEvents: make(map[string]time.Time),
+		cfg:     cfg,
+		watcher: watcher,
+		ignorer: common.NewPathIgnorer(cfg.IgnorePaths),
 	}, nil
 }
 
@@ -49,29 +51,31 @@ func (c *Client) Run() {
 	defer c.watcher.Close()
 	go c.watchFilesystem()
 	for {
-		c.connect()
+		err := c.connect()
+		if err != nil {
+			log.Error().Err(err).Msg("Connection failed, retrying in 5 seconds...")
+			time.Sleep(5 * time.Second)
+			continue
+		}
 		c.listenToServer()
-		log.Warn().Msg("Disconnected from server. Retrying in 5 seconds...")
+		log.Warn().Msg("Disconnected from server. Attempting to reconnect...")
 		time.Sleep(5 * time.Second)
 	}
 }
 
-func (c *Client) connect() {
+func (c *Client) connect() error {
 	u, err := url.Parse(c.cfg.ServerAddr)
 	if err != nil {
-		log.Fatal().Err(err).Msg("Invalid server URL")
+		return fmt.Errorf("invalid server URL: %w", err)
 	}
-	for {
-		conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
-		if err != nil {
-			log.Error().Err(err).Msg("Failed to connect to server. Retrying...")
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		c.conn = conn
-		log.Info().Str("addr", c.cfg.ServerAddr).Msg("Connected to server")
-		return
+	log.Info().Str("addr", u.String()).Msg("Connecting to server...")
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		return err
 	}
+	c.conn = conn
+	log.Info().Str("addr", c.cfg.ServerAddr).Msg("Successfully connected to server")
+	return nil
 }
 
 func (c *Client) listenToServer() {
@@ -82,16 +86,18 @@ func (c *Client) listenToServer() {
 			log.Error().Err(err).Msg("Error reading from server")
 			return
 		}
-		c.isSyncing = true
+		c.setSyncing(true)
 		switch wrapper.Type {
 		case common.TypeManifest:
 			c.handleManifest(wrapper.Payload)
 		case common.TypeFileContent:
 			c.handleFileContent(wrapper.Payload)
-		case common.TypeUpdateNotification:
-			c.handleUpdateNotification(wrapper.Payload)
+		case common.TypeFileOperation:
+			c.handleFileOperation(wrapper.Payload)
+		default:
+			log.Warn().Str("type", string(wrapper.Type)).Msg("Received unknown message type from server")
 		}
-		c.isSyncing = false
+		c.setSyncing(false)
 	}
 }
 
@@ -102,7 +108,6 @@ func (c *Client) handleManifest(payload []byte) {
 		return
 	}
 	log.Info().Msg("Received server manifest. Starting initial sync.")
-
 	localManifest, err := common.BuildFileManifest(c.cfg.SyncDir, c.ignorer)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to build local manifest for sync")
@@ -111,6 +116,7 @@ func (c *Client) handleManifest(payload []byte) {
 	var toRequest []string
 	serverFiles := make(map[string]bool)
 
+	// Compare server manifest with local manifest
 	for path, serverHash := range msg.Files {
 		serverFiles[path] = true
 		localHash, exists := localManifest[path]
@@ -118,14 +124,17 @@ func (c *Client) handleManifest(payload []byte) {
 			toRequest = append(toRequest, path)
 		}
 	}
+
+	// Remove local files not on server
 	for path := range localManifest {
 		if !serverFiles[path] {
 			fullPath := filepath.Join(c.cfg.SyncDir, path)
 			log.Info().Str("path", path).Msg("Removing local file not present on server")
-			os.RemoveAll(fullPath)
+			if err := os.RemoveAll(fullPath); err != nil {
+				log.Error().Err(err).Str("path", fullPath).Msg("Failed to remove local file")
+			}
 		}
 	}
-
 	if len(toRequest) > 0 {
 		log.Info().Int("count", len(toRequest)).Msg("Requesting files from server")
 		c.requestFiles(toRequest)
@@ -143,7 +152,7 @@ func (c *Client) handleFileContent(payload []byte) {
 	log.Info().Str("path", msg.Path).Msg("Received file content from server")
 	fullPath := filepath.Join(c.cfg.SyncDir, msg.Path)
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		log.Error().Err(err).Msg("Failed to create parent directories")
+		log.Error().Err(err).Str("path", fullPath).Msg("Failed to create parent directories")
 		return
 	}
 	if err := os.WriteFile(fullPath, msg.Content, 0644); err != nil {
@@ -151,21 +160,27 @@ func (c *Client) handleFileContent(payload []byte) {
 	}
 }
 
-func (c *Client) handleUpdateNotification(payload []byte) {
-	var msg common.UpdateNotificationMessage
-	if err := json.Unmarshal(payload, &msg); err != nil {
-		log.Error().Err(err).Msg("Failed to unmarshal update notification")
+func (c *Client) handleFileOperation(payload []byte) {
+	var op common.FileOperationMessage
+	if err := json.Unmarshal(payload, &op); err != nil {
+		log.Error().Err(err).Msg("Failed to unmarshal file operation")
 		return
 	}
-	log.Info().Str("op", msg.Op).Str("path", msg.Path).Msg("Received update notification")
-	fullPath := filepath.Join(c.cfg.SyncDir, msg.Path)
-	switch msg.Op {
+	log.Info().Str("op", string(op.Op)).Str("path", op.Path).Msg("Received file operation from server")
+	fullPath := filepath.Join(c.cfg.SyncDir, op.Path)
+
+	switch op.Op {
+	case common.OpWrite:
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			log.Error().Err(err).Msg("Failed to create parent directories")
+			return
+		}
+		if err := os.WriteFile(fullPath, op.Content, 0644); err != nil {
+			log.Error().Err(err).Str("path", op.Path).Msg("Failed to write file from operation")
+		}
 	case common.OpRemove:
-		os.RemoveAll(fullPath)
-	case common.OpCreate, common.OpWrite:
-		localHash, err := common.ComputeFileHash(fullPath)
-		if err != nil || localHash != msg.Hash {
-			c.requestFiles([]string{msg.Path})
+		if err := os.RemoveAll(fullPath); err != nil {
+			log.Error().Err(err).Str("path", fullPath).Msg("Failed to remove file from operation")
 		}
 	}
 }
@@ -176,41 +191,22 @@ func (c *Client) requestFiles(paths []string) {
 		Type:    common.TypeFileRequest,
 		Payload: payload,
 	}
-	if err := c.conn.WriteJSON(msg); err != nil {
-		log.Error().Err(err).Msg("Failed to send file request to server")
-	}
-}
-
-func (c *Client) sendUpdateNotification(op, path, hash string) {
-	relPath, err := filepath.Rel(c.cfg.SyncDir, path)
-	if err != nil {
-		log.Error().Err(err).Str("path", path).Msg("Failed to get relative path")
-		return
-	}
-	payload, _ := json.Marshal(common.UpdateNotificationMessage{Op: op, Path: relPath, Hash: hash})
-	msg := common.MessageWrapper{
-		Type:    common.TypeUpdateNotification,
-		Payload: payload,
-	}
-	if c.conn != nil {
-		if err := c.conn.WriteJSON(msg); err != nil {
-			log.Error().Err(err).Msg("Failed to send update notification to server")
-		}
-	}
+	c.sendMessage(msg)
 }
 
 func (c *Client) watchFilesystem() {
-	// Initial recursive watch setup
+	// Add all subdirectories to the watcher
 	filepath.Walk(c.cfg.SyncDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
+		if info != nil && info.IsDir() {
 			relPath, _ := filepath.Rel(c.cfg.SyncDir, path)
 			if !c.ignorer.IsIgnored(relPath) {
-				c.watcher.Add(path)
+				if err := c.watcher.Add(path); err != nil {
+					log.Error().Err(err).Str("path", path).Msg("Failed to add path to watcher")
+				}
 			}
 		}
 		return nil
 	})
-
 	for {
 		select {
 		case event, ok := <-c.watcher.Events:
@@ -218,18 +214,7 @@ func (c *Client) watchFilesystem() {
 				return
 			}
 			if c.isSyncing {
-				continue // Ignore events generated by our own sync process
-			}
-			relPath, err := filepath.Rel(c.cfg.SyncDir, event.Name)
-			if err != nil || c.ignorer.IsIgnored(relPath) {
-				continue
-			}
-			// Debounce write events
-			if event.Op&fsnotify.Write == fsnotify.Write {
-				if time.Since(c.writeEvents[event.Name]) < 1*time.Second {
-					continue
-				}
-				c.writeEvents[event.Name] = time.Now()
+				continue // Ignore events generated by own sync
 			}
 			c.handleFsEvent(event)
 		case err, ok := <-c.watcher.Errors:
@@ -242,29 +227,57 @@ func (c *Client) watchFilesystem() {
 }
 
 func (c *Client) handleFsEvent(event fsnotify.Event) {
-	var op, hash string
-	var err error
-	info, statErr := os.Stat(event.Name)
-	if event.Op&fsnotify.Create == fsnotify.Create {
-		op = common.OpCreate
-		if info.IsDir() {
-			c.watcher.Add(event.Name) // Watch new directories
-		} else {
-			hash, err = common.ComputeFileHash(event.Name)
-		}
-	} else if event.Op&fsnotify.Write == fsnotify.Write {
-		op = common.OpWrite
-		hash, err = common.ComputeFileHash(event.Name)
-	} else if event.Op&fsnotify.Remove == fsnotify.Remove || event.Op&fsnotify.Rename == fsnotify.Rename {
-		op = common.OpRemove
-		c.watcher.Remove(event.Name)
-	}
-	if err != nil {
-		log.Error().Err(err).Str("path", event.Name).Msg("Error processing file for notification")
+	relPath, err := filepath.Rel(c.cfg.SyncDir, event.Name)
+	if err != nil || c.ignorer.IsIgnored(relPath) {
 		return
 	}
-	if op != "" && (op == common.OpRemove || (op != common.OpRemove && statErr == nil && !info.IsDir())) {
-		log.Info().Str("op", op).Str("path", event.Name).Msg("Detected local file change")
-		c.sendUpdateNotification(op, event.Name, hash)
+	op := common.FileOperationMessage{Path: relPath}
+	if event.Op&fsnotify.Remove == fsnotify.Remove || event.Op&fsnotify.Rename == fsnotify.Rename {
+		op.Op = common.OpRemove
+		c.watcher.Remove(event.Name) // Stop watching removed files/dirs
+	} else if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
+		info, err := os.Stat(event.Name)
+		if err != nil {
+			return
+		}
+		if info.IsDir() {
+			// New directory, start watching
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				c.watcher.Add(event.Name)
+			}
+			return // Don't send operations for directories themselves.
+		}
+		op.Op = common.OpWrite
+		content, err := os.ReadFile(event.Name)
+		if err != nil {
+			log.Error().Err(err).Str("path", event.Name).Msg("Failed to read file for sending")
+			return
+		}
+		op.Content = content
+	} else {
+		return
 	}
+	log.Info().Str("op", string(op.Op)).Str("path", relPath).Msg("Detected local change, sending to server")
+	payload, _ := json.Marshal(op)
+	msg := common.MessageWrapper{
+		Type:    common.TypeFileOperation,
+		Payload: payload,
+	}
+	c.sendMessage(msg)
+}
+
+func (c *Client) sendMessage(message common.MessageWrapper) {
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
+	if c.conn != nil {
+		if err := c.conn.WriteJSON(message); err != nil {
+			log.Error().Err(err).Msg("Failed to send message to server")
+		}
+	}
+}
+
+func (c *Client) setSyncing(status bool) {
+	c.syncingMutex.Lock()
+	defer c.syncingMutex.Unlock()
+	c.isSyncing = status
 }

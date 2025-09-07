@@ -5,19 +5,26 @@ import "encoding/json"
 type MessageType string
 
 const (
-	// Server -> Client
-	TypeManifest           MessageType = "manifest"
-	TypeFileContent        MessageType = "file_content"
-	TypeUpdateNotification MessageType = "update_notification"
+	// Server to Client on connection - list of files and their hashes
+	TypeManifest MessageType = "manifest"
 
-	// Client -> Server
+	// Client to Server during initial sync - content for a list of files
 	TypeFileRequest MessageType = "file_request"
+
+	// Server to Client during initial sync - content of a single requested file
+	TypeFileContent MessageType = "file_content"
+
+	// Bidirectional for runtime changes
+	// Client -> Server - Informs about local change
+	// Server -> Client - Broadcasts change to other clients
+	TypeFileOperation MessageType = "file_operation"
 )
 
+type OperationType string
+
 const (
-	OpCreate = "create"
-	OpWrite  = "write"
-	OpRemove = "remove"
+	OpWrite  OperationType = "write"
+	OpRemove OperationType = "remove"
 )
 
 type MessageWrapper struct {
@@ -26,13 +33,7 @@ type MessageWrapper struct {
 }
 
 type ManifestMessage struct {
-	Files map[string]string `json:"files"` // Path -> Hash
-}
-
-type UpdateNotificationMessage struct {
-	Op   string `json:"op"`
-	Path string `json:"path"`
-	Hash string `json:"hash,omitempty"`
+	Files map[string]string `json:"files"`
 }
 
 type FileRequestMessage struct {
@@ -42,4 +43,10 @@ type FileRequestMessage struct {
 type FileContentMessage struct {
 	Path    string `json:"path"`
 	Content []byte `json:"content"`
+}
+
+type FileOperationMessage struct {
+	Op      OperationType `json:"op"`
+	Path    string        `json:"path"`
+	Content []byte        `json:"content,omitempty"`
 }

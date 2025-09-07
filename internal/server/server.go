@@ -21,16 +21,17 @@ type Config struct {
 }
 
 type clientConnection struct {
-	id   string
-	conn *websocket.Conn
+	id         string
+	conn       *websocket.Conn
+	writeMutex sync.Mutex
 }
 
 type Server struct {
-	cfg       Config
-	upgrader  websocket.Upgrader
-	clients   sync.Map // map[string]*clientConnection
+	cfg     Config
+	clients sync.Map // A concurrent map to store clients: map[string]*clientConnection
+	ignorer *common.PathIgnorer
+	// Global mutex for disk operations
 	diskMutex sync.Mutex
-	ignorer   *common.PathIgnorer
 }
 
 func New(cfg Config) (*Server, error) {
@@ -38,10 +39,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to create sync directory: %w", err)
 	}
 	return &Server{
-		cfg: cfg,
-		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool { return true },
-		},
+		cfg:     cfg,
 		ignorer: common.NewPathIgnorer(cfg.IgnorePaths),
 	}, nil
 }
@@ -49,17 +47,21 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Run() error {
 	http.HandleFunc("/ws", s.handleConnections)
 	addr := fmt.Sprintf(":%d", s.cfg.Port)
-	log.Info().Msgf("WebSocket server listening on %s", addr)
+	log.Info().Str("address", addr).Msg("WebSocket server starting to listen")
 	return http.ListenAndServe(addr, nil)
 }
 
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := s.upgrader.Upgrade(w, r, nil)
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to upgrade connection")
 		return
 	}
 	defer ws.Close()
+
 	client := &clientConnection{
 		id:   uuid.NewString(),
 		conn: ws,
@@ -70,6 +72,8 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		s.clients.Delete(client.id)
 		log.Info().Str("client_id", client.id).Msg("Client disconnected")
 	}()
+
+	// Start with current state of the filesystem
 	if err := s.sendInitialManifest(client); err != nil {
 		log.Error().Err(err).Str("client_id", client.id).Msg("Failed to send initial manifest")
 		return
@@ -78,6 +82,7 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendInitialManifest(client *clientConnection) error {
+	log.Info().Str("client_id", client.id).Msg("Building and sending initial manifest")
 	manifest, err := common.BuildFileManifest(s.cfg.SyncDir, s.ignorer)
 	if err != nil {
 		return fmt.Errorf("could not build file manifest: %w", err)
@@ -87,9 +92,7 @@ func (s *Server) sendInitialManifest(client *clientConnection) error {
 		Type:    common.TypeManifest,
 		Payload: payload,
 	}
-	s.diskMutex.Lock()
-	defer s.diskMutex.Unlock()
-	return client.conn.WriteJSON(msg)
+	return s.sendMessage(client, msg)
 }
 
 func (s *Server) handleClientMessages(client *clientConnection) {
@@ -104,8 +107,10 @@ func (s *Server) handleClientMessages(client *clientConnection) {
 		switch wrapper.Type {
 		case common.TypeFileRequest:
 			s.handleFileRequest(client, wrapper.Payload)
-		case common.TypeUpdateNotification:
-			s.handleUpdateNotification(client, wrapper.Payload)
+		case common.TypeFileOperation:
+			s.handleFileOperation(client, wrapper.Payload)
+		default:
+			log.Warn().Str("type", string(wrapper.Type)).Msg("Received unknown message type from client")
 		}
 	}
 }
@@ -116,6 +121,7 @@ func (s *Server) handleFileRequest(client *clientConnection, payload []byte) {
 		log.Error().Err(err).Msg("Failed to unmarshal file request")
 		return
 	}
+	log.Info().Int("count", len(req.Paths)).Str("client_id", client.id).Msg("Handling file request")
 	for _, path := range req.Paths {
 		if s.ignorer.IsIgnored(path) {
 			continue
@@ -131,70 +137,68 @@ func (s *Server) handleFileRequest(client *clientConnection, payload []byte) {
 			Type:    common.TypeFileContent,
 			Payload: contentPayload,
 		}
-		s.diskMutex.Lock()
-		err = client.conn.WriteJSON(msg)
-		s.diskMutex.Unlock()
-		if err != nil {
+		if err := s.sendMessage(client, msg); err != nil {
 			log.Error().Err(err).Str("client_id", client.id).Msg("Failed to send file content")
+			break
 		}
 	}
 }
 
-func (s *Server) handleUpdateNotification(sender *clientConnection, payload []byte) {
-	var update common.UpdateNotificationMessage
-	if err := json.Unmarshal(payload, &update); err != nil {
-		log.Error().Err(err).Msg("Failed to unmarshal update notification")
+func (s *Server) handleFileOperation(sender *clientConnection, payload []byte) {
+	var op common.FileOperationMessage
+	if err := json.Unmarshal(payload, &op); err != nil {
+		log.Error().Err(err).Msg("Failed to unmarshal file operation")
 		return
 	}
-	if s.ignorer.IsIgnored(update.Path) {
-		log.Debug().Str("path", update.Path).Msg("Ignoring update notification based on server rules")
+	if s.ignorer.IsIgnored(op.Path) {
+		log.Debug().Str("path", op.Path).Msg("Ignoring file operation based on server rules")
 		return
 	}
-	log.Info().Str("op", update.Op).Str("path", update.Path).Str("client_id", sender.id).Msg("Received update from client")
-
-	// Server does not automatically apply change; it expects to receive file content next.
-	// It just relays the notification. A more robust implementation might verify the change first.
-
-	s.broadcastUpdate(sender.id, update)
+	log.Info().Str("op", string(op.Op)).Str("path", op.Path).Str("client_id", sender.id).Msg("Received file operation from client")
+	s.applyChangeLocally(&op)
+	s.broadcastOperation(sender.id, &op)
 }
 
-func (s *Server) applyChangeLocally(update common.UpdateNotificationMessage, content []byte) {
+func (s *Server) applyChangeLocally(op *common.FileOperationMessage) {
 	s.diskMutex.Lock()
 	defer s.diskMutex.Unlock()
-	fullPath := filepath.Join(s.cfg.SyncDir, update.Path)
-	switch update.Op {
-	case common.OpCreate, common.OpWrite:
+	fullPath := filepath.Join(s.cfg.SyncDir, op.Path)
+	switch op.Op {
+	case common.OpWrite:
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			log.Error().Err(err).Str("path", fullPath).Msg("Failed to create parent directories")
 			return
 		}
-		if err := os.WriteFile(fullPath, content, 0644); err != nil {
+		if err := os.WriteFile(fullPath, op.Content, 0644); err != nil {
 			log.Error().Err(err).Str("path", fullPath).Msg("Failed to write file")
 		}
 	case common.OpRemove:
-		if err := os.Remove(fullPath); err != nil {
-			log.Error().Err(err).Str("path", fullPath).Msg("Failed to remove file")
+		if err := os.RemoveAll(fullPath); err != nil {
+			log.Error().Err(err).Str("path", fullPath).Msg("Failed to remove file/directory")
 		}
 	}
 }
 
-func (s *Server) broadcastUpdate(senderID string, update common.UpdateNotificationMessage) {
-	payload, _ := json.Marshal(update)
+func (s *Server) broadcastOperation(senderID string, op *common.FileOperationMessage) {
+	payload, _ := json.Marshal(op)
 	msg := common.MessageWrapper{
-		Type:    common.TypeUpdateNotification,
+		Type:    common.TypeFileOperation,
 		Payload: payload,
 	}
 	s.clients.Range(func(key, value interface{}) bool {
 		id := key.(string)
 		client := value.(*clientConnection)
 		if id != senderID {
-			s.diskMutex.Lock()
-			err := client.conn.WriteJSON(msg)
-			s.diskMutex.Unlock()
-			if err != nil {
-				log.Error().Err(err).Str("client_id", id).Msg("Failed to broadcast update")
+			if err := s.sendMessage(client, msg); err != nil {
+				log.Error().Err(err).Str("client_id", id).Msg("Failed to broadcast operation")
 			}
 		}
-		return true
+		return true // continue iteration
 	})
+}
+
+func (s *Server) sendMessage(client *clientConnection, message common.MessageWrapper) error {
+	client.writeMutex.Lock()
+	defer client.writeMutex.Unlock()
+	return client.conn.WriteJSON(message)
 }

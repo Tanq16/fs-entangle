@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/rs/zerolog/log"
 )
 
@@ -20,19 +19,12 @@ func NewPathIgnorer(ignoreStr string) *PathIgnorer {
 	if ignoreStr == "" {
 		return &PathIgnorer{patterns: []string{}}
 	}
-	patterns := strings.Split(ignoreStr, ",")
-	// Add gitignore-style directory matching
-	for i, p := range patterns {
-		if !strings.HasSuffix(p, "**") {
-			patterns[i] = strings.TrimSuffix(p, "/") + "/**"
-		}
-	}
-	return &PathIgnorer{patterns: patterns}
+	return &PathIgnorer{patterns: strings.Split(ignoreStr, ",")}
 }
 
 func (pi *PathIgnorer) IsIgnored(path string) bool {
 	for _, pattern := range pi.patterns {
-		match, err := doublestar.Match(pattern, path)
+		match, err := filepath.Match(pattern, path)
 		if err == nil && match {
 			return true
 		}
@@ -69,7 +61,7 @@ func BuildFileManifest(rootDir string, ignorer *PathIgnorer) (map[string]string,
 		if ignorer.IsIgnored(relPath) {
 			log.Debug().Str("path", relPath).Msg("Ignoring path based on rules")
 			if info.IsDir() {
-				return filepath.SkipDir
+				return filepath.SkipDir // Don't traverse into ignored directories.
 			}
 			return nil
 		}
@@ -77,7 +69,7 @@ func BuildFileManifest(rootDir string, ignorer *PathIgnorer) (map[string]string,
 			hash, err := ComputeFileHash(path)
 			if err != nil {
 				log.Error().Err(err).Str("path", path).Msg("Failed to compute hash for file")
-				return nil // Continue walking even if one file fails
+				return nil
 			}
 			manifest[relPath] = hash
 		}
