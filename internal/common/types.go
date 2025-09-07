@@ -48,5 +48,6 @@ type FileContentMessage struct {
 type FileOperationMessage struct {
 	Op      OperationType `json:"op"`
 	Path    string        `json:"path"`
-	Content []byte        `json:"content,omitempty"`
+	Content []byte        `json:"content"`
+	IsDir   bool          `json:"is_dir,omitempty"`
 }

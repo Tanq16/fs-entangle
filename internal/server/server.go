@@ -165,6 +165,12 @@ func (s *Server) applyChangeLocally(op *common.FileOperationMessage) {
 	fullPath := filepath.Join(s.cfg.SyncDir, op.Path)
 	switch op.Op {
 	case common.OpWrite:
+		if op.IsDir {
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				log.Error().Err(err).Str("path", fullPath).Msg("Failed to create directory")
+			}
+			return
+		}
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			log.Error().Err(err).Str("path", fullPath).Msg("Failed to create parent directories")
 			return

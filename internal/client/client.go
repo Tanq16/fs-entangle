@@ -171,6 +171,12 @@ func (c *Client) handleFileOperation(payload []byte) {
 
 	switch op.Op {
 	case common.OpWrite:
+		if op.IsDir {
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				log.Error().Err(err).Str("path", op.Path).Msg("Failed to create directory from operation")
+			}
+			return
+		}
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			log.Error().Err(err).Msg("Failed to create parent directories")
 			return
@@ -238,22 +244,25 @@ func (c *Client) handleFsEvent(event fsnotify.Event) {
 	} else if event.Op&fsnotify.Write == fsnotify.Write || event.Op&fsnotify.Create == fsnotify.Create {
 		info, err := os.Stat(event.Name)
 		if err != nil {
+			// File may have been removed quickly, ignore error
 			return
-		}
-		if info.IsDir() {
-			// New directory, start watching
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				c.watcher.Add(event.Name)
-			}
-			return // Don't send operations for directories themselves.
 		}
 		op.Op = common.OpWrite
-		content, err := os.ReadFile(event.Name)
-		if err != nil {
-			log.Error().Err(err).Str("path", event.Name).Msg("Failed to read file for sending")
-			return
+		if info.IsDir() {
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				c.watcher.Add(event.Name)
+				op.IsDir = true
+			} else {
+				return
+			}
+		} else {
+			content, err := os.ReadFile(event.Name)
+			if err != nil {
+				log.Error().Err(err).Str("path", event.Name).Msg("Failed to read file for sending")
+				return
+			}
+			op.Content = content
 		}
-		op.Content = content
 	} else {
 		return
 	}
