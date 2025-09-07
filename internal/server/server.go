@@ -26,11 +26,16 @@ type clientConnection struct {
 	writeMutex sync.Mutex
 }
 
+type fileOperationEnvelope struct {
+	senderID string
+	op       common.FileOperationMessage
+}
+
 type Server struct {
-	cfg     Config
-	clients sync.Map // A concurrent map to store clients: map[string]*clientConnection
-	ignorer *common.PathIgnorer
-	// Global mutex for disk operations
+	cfg       Config
+	clients   sync.Map // A concurrent map to store clients: map[string]*clientConnection
+	ignorer   *common.PathIgnorer
+	opChan    chan fileOperationEnvelope
 	diskMutex sync.Mutex
 }
 
@@ -41,14 +46,27 @@ func New(cfg Config) (*Server, error) {
 	return &Server{
 		cfg:     cfg,
 		ignorer: common.NewPathIgnorer(cfg.IgnorePaths),
+		// Buffered channel to act as the operation ingest queue
+		opChan: make(chan fileOperationEnvelope, 100),
 	}, nil
 }
 
 func (s *Server) Run() error {
+	// Central goroutine to process all incoming operations serially
+	go s.processOperationQueue()
 	http.HandleFunc("/ws", s.handleConnections)
 	addr := fmt.Sprintf(":%d", s.cfg.Port)
 	log.Info().Str("address", addr).Msg("WebSocket server starting to listen")
 	return http.ListenAndServe(addr, nil)
+}
+
+func (s *Server) processOperationQueue() {
+	log.Info().Msg("Starting file operation queue processor")
+	for envelope := range s.opChan {
+		log.Info().Str("op", string(envelope.op.Op)).Str("path", envelope.op.Path).Str("client_id", envelope.senderID).Msg("Processing operation from queue")
+		s.applyChangeLocally(&envelope.op)
+		s.broadcastOperation(envelope.senderID, &envelope.op)
+	}
 }
 
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
@@ -61,7 +79,6 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer ws.Close()
-
 	client := &clientConnection{
 		id:   uuid.NewString(),
 		conn: ws,
@@ -72,8 +89,6 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		s.clients.Delete(client.id)
 		log.Info().Str("client_id", client.id).Msg("Client disconnected")
 	}()
-
-	// Start with current state of the filesystem
 	if err := s.sendInitialManifest(client); err != nil {
 		log.Error().Err(err).Str("client_id", client.id).Msg("Failed to send initial manifest")
 		return
@@ -154,9 +169,11 @@ func (s *Server) handleFileOperation(sender *clientConnection, payload []byte) {
 		log.Debug().Str("path", op.Path).Msg("Ignoring file operation based on server rules")
 		return
 	}
-	log.Info().Str("op", string(op.Op)).Str("path", op.Path).Str("client_id", sender.id).Msg("Received file operation from client")
-	s.applyChangeLocally(&op)
-	s.broadcastOperation(sender.id, &op)
+	log.Debug().Str("path", op.Path).Str("client_id", sender.id).Msg("Received and queuing file operation")
+	s.opChan <- fileOperationEnvelope{
+		senderID: sender.id,
+		op:       op,
+	}
 }
 
 func (s *Server) applyChangeLocally(op *common.FileOperationMessage) {
