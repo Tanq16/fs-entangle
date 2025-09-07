@@ -20,6 +20,7 @@ All-in-one client+server file-system watcher that allows sync across multiple cl
 - Multi-client sync support with thread-safe write operations on server (source of truth)
 - Realtime sync to server and simultaneous broadcast to all active clients
 - Websocket-based network communication for data sync
+- Available as an extremely lean Docker container to run in homelab settings
 
 ## Installation
 
@@ -53,3 +54,12 @@ File/folder patterns can be ignored from client and/or server by using the `--ig
 
 > [!IMPORTANT]
 > Server is always considered source of truth and is synced at first connect. Make sure you make changes after the initial sync (i.e., when the client connects to the server).
+
+To run via Docker, mount your directory to `/data` and add any applicable ignore patterns like so:
+
+```bash
+docker run --rm -p 8080:8080 \
+-v /home/tanq/knowledgebase:/data \
+-it tanq16/fs-entangle:main \
+--ignore ".obsidian,.DS_Store"
+```
