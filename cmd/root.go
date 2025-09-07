@@ -30,7 +30,7 @@ func init() {
 func initConfig() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{
 		Out:        os.Stderr,
-		TimeFormat: time.RFC3339,
+		TimeFormat: time.DateTime,
 	})
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	log.Info().Msg("Logger initialized")
