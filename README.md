@@ -4,7 +4,7 @@
 
 <h1>FS-Entangle</h1>
 
-[![Release Build](https://github.com/tanq16/fs-entangle/actions/workflows/build-release.yml/badge.svg)](https://github.com/tanq16/fs-entangle/actions/workflows/build-release.yml)
+[![Release Build](https://github.com/tanq16/fs-entangle/actions/workflows/release.yml/badge.svg)](https://github.com/tanq16/fs-entangle/actions/workflows/release.yml)
 [![GitHub Release](https://img.shields.io/github/v/release/tanq16/fs-entangle)](https://github.com/Tanq16/fs-entangle/releases/latest)
 
 All-in-one client+server file-system watcher that allows sync across multiple clients via a designated server for realtime updates.
